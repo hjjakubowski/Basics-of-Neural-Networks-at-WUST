@@ -127,8 +127,9 @@ class NeuralNetwork:
         m = X_batch.shape[0]
         y_hat = self.feedforward(X_batch, training=True)
 
-        dL_dy_hat = (y_hat - y_batch) / m
-        delta_output = dL_dy_hat * self.sigmoid_derivative_from_output(y_hat)
+        # BCE gradient: (y_hat - y) / (y_hat * (1 - y_hat))
+        # Combined with sigmoid derivative gives: (y_hat - y)
+        delta_output = (y_hat - y_batch) / m
 
         grad_w_ho = np.dot(self.a_hidden.T, delta_output)
         grad_b_o = np.sum(delta_output, axis=0, keepdims=True)
@@ -185,15 +186,19 @@ class NeuralNetwork:
             self.learning_rate * m_hat_b_h / (np.sqrt(v_hat_b_h) + self.epsilon)
         )
 
-        batch_mse = 0.5 * np.mean((y_hat - y_batch) ** 2)
-        return batch_mse
+        # Binary Cross-Entropy Loss instead of MSE
+        batch_bce = -np.mean(
+            y_batch * np.log(y_hat + 1e-15) + (1 - y_batch) * np.log(1 - y_hat + 1e-15)
+        )
+        return batch_bce
 
     def _compute_full_metrics(self, X, y):
         y_hat = self.feedforward(X, training=False)
-        mse = 0.5 * np.mean((y_hat - y) ** 2)
+
+        bce = -np.mean(y * np.log(y_hat + 1e-15) + (1 - y) * np.log(1 - y_hat + 1e-15))
         y_pred_labels = (y_hat >= 0.5).astype(int)
         class_error = 1.0 - np.mean(y_pred_labels == y)
-        return mse, class_error
+        return bce, class_error
 
     def train(
         self,
@@ -278,19 +283,17 @@ class NeuralNetwork:
                 val_accuracy,
             )
 
-            show_epoch = epoch < 5 or epoch % 100 == 0 or epoch >= self.max_epochs - 5
+            show_epoch = epoch < 5 or (epoch > 0 and epoch % 100 == 0)
 
             if verbose and show_epoch:
                 if np.isfinite(val_accuracy):
                     print(
-                        f"Epoch {epoch:4d} | Loss: {epoch_loss:.6f} | "
-                        f"Train Acc: {train_accuracy*100:.2f}% | "
-                        f"Val Acc: {val_accuracy*100:.2f}%"
+                        f"Epoch {epoch:4d} | Train: Loss={epoch_loss:.6f} Acc={train_accuracy*100:.2f}% | "
+                        f"Val: Loss={val_loss:.6f} Acc={val_accuracy*100:.2f}%"
                     )
                 else:
                     print(
-                        f"Epoch {epoch:4d} | Loss: {epoch_loss:.6f} | "
-                        f"Accuracy: {train_accuracy*100:.2f}%"
+                        f"Epoch {epoch:4d} | Train: Loss={epoch_loss:.6f} Acc={train_accuracy*100:.2f}%"
                     )
 
             if (
@@ -301,8 +304,14 @@ class NeuralNetwork:
                     f"early_stopping (patience={self.early_stopping_patience})"
                 )
                 if verbose:
+                    if np.isfinite(val_accuracy):
+                        print(
+                            f"Epoch {epoch:4d} | Train: Loss={epoch_loss:.6f} Acc={train_accuracy*100:.2f}% | "
+                            f"Val: Loss={val_loss:.6f} Acc={val_accuracy*100:.2f}%"
+                        )
                     print(
-                        f"\n[Epoch {epoch}] Validation loss hasn't improved for {self.early_stopping_patience} epochs. Stopping."
+                        f"\n[Early Stopping] No improvement for {self.early_stopping_patience} epochs. "
+                        f"Best was at epoch {best_epoch}."
                     )
                 break
 
@@ -323,20 +332,19 @@ class NeuralNetwork:
             print("=" * 60)
             print(f"Przyczyna zatrzymania: {stop_reason}")
             print(f"Liczba wykonanych epok: {epoch + 1} / {self.max_epochs}")
-            print(
-                f"Najlepszy (monitorowany) loss: {best_loss:.6f} (epoch {best_epoch})"
-            )
+            print(f"Najlepszy epoch: {best_epoch} (validation loss: {best_loss:.6f})")
+            print(f"Przywrócono wagi z epoch {best_epoch}")
 
             if X_val is not None and y_val is not None:
                 final_val_loss, final_val_err = self._compute_full_metrics(X_val, y_val)
                 final_val_accuracy = 1.0 - final_val_err
-                print(f"\nKOŃCOWE METRYKI WALIDACYJNE:")
+                print(f"\nMETRYKI WALIDACYJNE (z epoch {best_epoch}):")
                 print(f"  Loss: {final_val_loss:.6f}")
                 print(f"  Accuracy: {final_val_accuracy*100:.2f}%")
 
             final_train_loss, final_train_err = self._compute_full_metrics(X, y)
             final_train_accuracy = 1.0 - final_train_err
-            print(f"\nKOŃCOWE METRYKI TRENINGOWE:")
+            print(f"\nMETRYKI TRENINGOWE (z epoch {best_epoch}):")
             print(f"  Loss: {final_train_loss:.6f}")
             print(f"  Accuracy: {final_train_accuracy*100:.2f}%")
             print("=" * 60)
