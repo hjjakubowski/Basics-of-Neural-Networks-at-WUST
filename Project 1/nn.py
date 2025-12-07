@@ -29,15 +29,21 @@ class NeuralNetwork:
 
         self.activation_name = activation
         self.input_size = input_size
-        self.hidden_size = hidden_size
+
+        if isinstance(hidden_size, (list, tuple)):
+            self.hidden_sizes = list(hidden_size)
+        else:
+            self.hidden_sizes = [hidden_size]
+
         self.output_size = output_size
+        self.n_layers = len(self.hidden_sizes) + 1
 
         self.base_learning_rate = learning_rate
         self.learning_rate = learning_rate
         self.lr_decay = lr_decay
         self.l2_lambda = max(0.0, l2_lambda)
         self.dropout_rate = dropout_rate
-        self._dropout_mask = None
+        self._dropout_masks = [None] * len(self.hidden_sizes)
 
         self.beta1 = beta1
         self.beta2 = beta2
@@ -48,27 +54,41 @@ class NeuralNetwork:
         self.early_stopping_patience = early_stopping_patience
         self._patience_counter = 0
 
-        if activation == "relu":
-            limit1 = np.sqrt(2.0 / input_size)
-        else:
-            limit1 = np.sqrt(1.0 / input_size)
-        self.weights_input_hidden = np.random.randn(input_size, hidden_size) * limit1
+        # Initialize weights and biases for all layers
+        self.weights = []
+        self.biases = []
+        self.m_w = []  # Adam first moment for weights
+        self.v_w = []  # Adam second moment for weights
+        self.m_b = []  # Adam first moment for biases
+        self.v_b = []  # Adam second moment for biases
 
-        limit2 = np.sqrt(1.0 / hidden_size)
-        self.weights_hidden_output = np.random.randn(hidden_size, output_size) * limit2
+        # Build layer architecture
+        layer_sizes = [input_size] + self.hidden_sizes + [output_size]
 
-        self.bias_hidden = np.zeros((1, hidden_size))
-        self.bias_output = np.zeros((1, output_size))
+        for i in range(len(layer_sizes) - 1):
+            in_size = layer_sizes[i]
+            out_size = layer_sizes[i + 1]
 
-        self.m_w_ih = np.zeros_like(self.weights_input_hidden)
-        self.v_w_ih = np.zeros_like(self.weights_input_hidden)
-        self.m_b_h = np.zeros_like(self.bias_hidden)
-        self.v_b_h = np.zeros_like(self.bias_hidden)
+            # He initialization for ReLU, Xavier for sigmoid
+            if activation == "relu" and i < len(self.hidden_sizes):
+                limit = np.sqrt(2.0 / in_size)
+            else:
+                limit = np.sqrt(1.0 / in_size)
 
-        self.m_w_ho = np.zeros_like(self.weights_hidden_output)
-        self.v_w_ho = np.zeros_like(self.weights_hidden_output)
-        self.m_b_o = np.zeros_like(self.bias_output)
-        self.v_b_o = np.zeros_like(self.bias_output)
+            w = np.random.randn(in_size, out_size) * limit
+            b = np.zeros((1, out_size))
+
+            self.weights.append(w)
+            self.biases.append(b)
+            self.m_w.append(np.zeros_like(w))
+            self.v_w.append(np.zeros_like(w))
+            self.m_b.append(np.zeros_like(b))
+            self.v_b.append(np.zeros_like(b))
+
+        self.weights_input_hidden = self.weights[0]
+        self.weights_hidden_output = self.weights[-1]
+        self.bias_hidden = self.biases[0]
+        self.bias_output = self.biases[-1]
 
         self.t = 0
 
@@ -100,93 +120,104 @@ class NeuralNetwork:
         return (x > 0.0).astype(float)
 
     def feedforward(self, X, training=False):
-        self.z_hidden = np.dot(X, self.weights_input_hidden) + self.bias_hidden
-        if self.activation_name == "sigmoid":
-            self.a_hidden = self.sigmoid(self.z_hidden)
-        elif self.activation_name == "relu":
-            self.a_hidden = self.relu(self.z_hidden)
-        else:
-            raise ValueError("Unsupported activation function")
+        self.activations = [X]  # Start with input
+        self.z_values = []  # Pre-activation values
 
-        if training and self.dropout_rate > 0.0:
-            keep_prob = 1.0 - self.dropout_rate
-            self._dropout_mask = (
-                np.random.rand(*self.a_hidden.shape) < keep_prob
-            ).astype(self.a_hidden.dtype) / keep_prob
-            self.a_hidden *= self._dropout_mask
-        else:
-            self._dropout_mask = None
+        for i in range(len(self.hidden_sizes)):
+            z = np.dot(self.activations[-1], self.weights[i]) + self.biases[i]
+            self.z_values.append(z)
 
-        self.z_output = (
-            np.dot(self.a_hidden, self.weights_hidden_output) + self.bias_output
-        )
-        self.y_hat = self.sigmoid(self.z_output)
-        return self.y_hat
+            if self.activation_name == "sigmoid":
+                a = self.sigmoid(z)
+            elif self.activation_name == "relu":
+                a = self.relu(z)
+            else:
+                raise ValueError("Unsupported activation function")
+
+            if training and self.dropout_rate > 0.0:
+                keep_prob = 1.0 - self.dropout_rate
+                self._dropout_masks[i] = (np.random.rand(*a.shape) < keep_prob).astype(
+                    a.dtype
+                ) / keep_prob
+                a *= self._dropout_masks[i]
+            else:
+                self._dropout_masks[i] = None
+
+            self.activations.append(a)
+
+        z_output = np.dot(self.activations[-1], self.weights[-1]) + self.biases[-1]
+        self.z_values.append(z_output)
+        y_hat = self.sigmoid(z_output)
+        self.activations.append(y_hat)
+
+        self.z_hidden = self.z_values[0]
+        self.a_hidden = self.activations[1]
+        self.z_output = z_output
+        self.y_hat = y_hat
+
+        return y_hat
 
     def backward_batch(self, X_batch, y_batch):
         m = X_batch.shape[0]
         y_hat = self.feedforward(X_batch, training=True)
 
-        # BCE gradient: (y_hat - y) / (y_hat * (1 - y_hat))
-        # Combined with sigmoid derivative gives: (y_hat - y)
-        delta_output = (y_hat - y_batch) / m
+        deltas = [None] * self.n_layers
+        gradients_w = []
+        gradients_b = []
 
-        grad_w_ho = np.dot(self.a_hidden.T, delta_output)
-        grad_b_o = np.sum(delta_output, axis=0, keepdims=True)
+        deltas[-1] = (y_hat - y_batch) / m
 
-        hidden_error = np.dot(delta_output, self.weights_hidden_output.T)
-        if self.activation_name == "sigmoid":
-            hidden_delta = hidden_error * self.sigmoid_derivative_from_output(
-                self.a_hidden
-            )
-        else:
-            hidden_delta = hidden_error * self.relu_derivative_from_pre(self.z_hidden)
+        for i in range(self.n_layers - 2, -1, -1):
+            error = np.dot(deltas[i + 1], self.weights[i + 1].T)
 
-        if self._dropout_mask is not None:
-            hidden_delta *= self._dropout_mask
+            if self.activation_name == "sigmoid":
+                deltas[i] = error * self.sigmoid_derivative_from_output(
+                    self.activations[i + 1]
+                )
+            else:
+                deltas[i] = error * self.relu_derivative_from_pre(self.z_values[i])
 
-        grad_w_ih = np.dot(X_batch.T, hidden_delta)
-        grad_b_h = np.sum(hidden_delta, axis=0, keepdims=True)
+            if i < len(self._dropout_masks) and self._dropout_masks[i] is not None:
+                deltas[i] *= self._dropout_masks[i]
 
-        if self.l2_lambda > 0.0:
-            grad_w_ho += (self.l2_lambda / m) * self.weights_hidden_output
-            grad_w_ih += (self.l2_lambda / m) * self.weights_input_hidden
+        for i in range(self.n_layers):
+            grad_w = np.dot(self.activations[i].T, deltas[i])
+            grad_b = np.sum(deltas[i], axis=0, keepdims=True)
+
+            if self.l2_lambda > 0.0:
+                grad_w += (self.l2_lambda / m) * self.weights[i]
+
+            gradients_w.append(grad_w)
+            gradients_b.append(grad_b)
 
         self.t += 1
 
-        self.m_w_ho = self.beta1 * self.m_w_ho + (1 - self.beta1) * grad_w_ho
-        self.v_w_ho = self.beta2 * self.v_w_ho + (1 - self.beta2) * (grad_w_ho**2)
-        m_hat_w_ho = self.m_w_ho / (1 - self.beta1**self.t)
-        v_hat_w_ho = self.v_w_ho / (1 - self.beta2**self.t)
-        self.weights_hidden_output -= (
-            self.learning_rate * m_hat_w_ho / (np.sqrt(v_hat_w_ho) + self.epsilon)
-        )
+        for i in range(self.n_layers):
+            self.m_w[i] = self.beta1 * self.m_w[i] + (1 - self.beta1) * gradients_w[i]
+            self.v_w[i] = self.beta2 * self.v_w[i] + (1 - self.beta2) * (
+                gradients_w[i] ** 2
+            )
+            m_hat_w = self.m_w[i] / (1 - self.beta1**self.t)
+            v_hat_w = self.v_w[i] / (1 - self.beta2**self.t)
+            self.weights[i] -= (
+                self.learning_rate * m_hat_w / (np.sqrt(v_hat_w) + self.epsilon)
+            )
 
-        self.m_b_o = self.beta1 * self.m_b_o + (1 - self.beta1) * grad_b_o
-        self.v_b_o = self.beta2 * self.v_b_o + (1 - self.beta2) * (grad_b_o**2)
-        m_hat_b_o = self.m_b_o / (1 - self.beta1**self.t)
-        v_hat_b_o = self.v_b_o / (1 - self.beta2**self.t)
-        self.bias_output -= (
-            self.learning_rate * m_hat_b_o / (np.sqrt(v_hat_b_o) + self.epsilon)
-        )
+            self.m_b[i] = self.beta1 * self.m_b[i] + (1 - self.beta1) * gradients_b[i]
+            self.v_b[i] = self.beta2 * self.v_b[i] + (1 - self.beta2) * (
+                gradients_b[i] ** 2
+            )
+            m_hat_b = self.m_b[i] / (1 - self.beta1**self.t)
+            v_hat_b = self.v_b[i] / (1 - self.beta2**self.t)
+            self.biases[i] -= (
+                self.learning_rate * m_hat_b / (np.sqrt(v_hat_b) + self.epsilon)
+            )
 
-        self.m_w_ih = self.beta1 * self.m_w_ih + (1 - self.beta1) * grad_w_ih
-        self.v_w_ih = self.beta2 * self.v_w_ih + (1 - self.beta2) * (grad_w_ih**2)
-        m_hat_w_ih = self.m_w_ih / (1 - self.beta1**self.t)
-        v_hat_w_ih = self.v_w_ih / (1 - self.beta2**self.t)
-        self.weights_input_hidden -= (
-            self.learning_rate * m_hat_w_ih / (np.sqrt(v_hat_w_ih) + self.epsilon)
-        )
+        self.weights_input_hidden = self.weights[0]
+        self.weights_hidden_output = self.weights[-1]
+        self.bias_hidden = self.biases[0]
+        self.bias_output = self.biases[-1]
 
-        self.m_b_h = self.beta1 * self.m_b_h + (1 - self.beta1) * grad_b_h
-        self.v_b_h = self.beta2 * self.v_b_h + (1 - self.beta2) * (grad_b_h**2)
-        m_hat_b_h = self.m_b_h / (1 - self.beta1**self.t)
-        v_hat_b_h = self.v_b_h / (1 - self.beta2**self.t)
-        self.bias_hidden -= (
-            self.learning_rate * m_hat_b_h / (np.sqrt(v_hat_b_h) + self.epsilon)
-        )
-
-        # Binary Cross-Entropy Loss instead of MSE
         batch_bce = -np.mean(
             y_batch * np.log(y_hat + 1e-15) + (1 - y_batch) * np.log(1 - y_hat + 1e-15)
         )
@@ -387,14 +418,11 @@ class NeuralNetwork:
         return (proba >= threshold).astype(int)
 
     def _reset_optimizer_state(self):
-        self.m_w_ih.fill(0.0)
-        self.v_w_ih.fill(0.0)
-        self.m_b_h.fill(0.0)
-        self.v_b_h.fill(0.0)
-        self.m_w_ho.fill(0.0)
-        self.v_w_ho.fill(0.0)
-        self.m_b_o.fill(0.0)
-        self.v_b_o.fill(0.0)
+        for i in range(len(self.weights)):
+            self.m_w[i].fill(0.0)
+            self.v_w[i].fill(0.0)
+            self.m_b[i].fill(0.0)
+            self.v_b[i].fill(0.0)
         self.t = 0
 
     def _reset_history(self):
@@ -443,14 +471,16 @@ class NeuralNetwork:
 
     def _snapshot_weights(self):
         return {
-            "weights_input_hidden": self.weights_input_hidden.copy(),
-            "weights_hidden_output": self.weights_hidden_output.copy(),
-            "bias_hidden": self.bias_hidden.copy(),
-            "bias_output": self.bias_output.copy(),
+            "weights": [w.copy() for w in self.weights],
+            "biases": [b.copy() for b in self.biases],
         }
 
     def _restore_weights(self, state):
-        self.weights_input_hidden = state["weights_input_hidden"]
-        self.weights_hidden_output = state["weights_hidden_output"]
-        self.bias_hidden = state["bias_hidden"]
-        self.bias_output = state["bias_output"]
+        self.weights = [w.copy() for w in state["weights"]]
+        self.biases = [b.copy() for b in state["biases"]]
+
+        # Update backward compatibility references
+        self.weights_input_hidden = self.weights[0]
+        self.weights_hidden_output = self.weights[-1]
+        self.bias_hidden = self.biases[0]
+        self.bias_output = self.biases[-1]
